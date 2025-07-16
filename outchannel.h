@@ -22,17 +22,17 @@
 #ifndef OUTCHANNEL_H
 #define OUTCHANNEL_H
 struct outchannel {
-	struct outchannel *pNext;
-	char *pszName;
-	int iLenName;
-	uchar *pszFileTemplate;
-	off_t	uSizeLimit;
-	uchar *cmdOnSizeLimit;
+    struct outchannel *pNext;
+    char *pszName;
+    int iLenName;
+    uchar *pszFileTemplate;
+    off_t uSizeLimit;
+    uchar *cmdOnSizeLimit;
 };
 
-struct outchannel* ochConstruct(void);
-struct outchannel *ochAddLine(char* pName, unsigned char** pRestOfConfLine);
+struct outchannel *ochConstruct(void);
+struct outchannel *ochAddLine(char *pName, unsigned char **pRestOfConfLine);
 struct outchannel *ochFind(char *pName, int iLenName);
 void ochDeleteAll(void);
-void ochPrintList(void);
+void ochPrintList(rsconf_t *cnf);
 #endif /* #ifdef OUTCHANNEL_H */

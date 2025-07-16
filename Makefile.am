@@ -74,6 +74,10 @@ if ENABLE_OMSTDOUT
 SUBDIRS += plugins/omstdout
 endif
 
+if ENABLE_OMSENDERTRACK
+SUBDIRS += plugins/omsendertrack
+endif
+
 if ENABLE_PMCISCONAMES
 SUBDIRS += contrib/pmcisconames
 endif
@@ -202,12 +206,32 @@ if ENABLE_FMUNFLATTEN
 SUBDIRS += contrib/fmunflatten
 endif
 
+if ENABLE_FMPCRE
+SUBDIRS += plugins/fmpcre
+endif
+
+if ENABLE_FFAUP
+SUBDIRS += contrib/ffaup
+endif
+
 if ENABLE_OMKAFKA
 SUBDIRS += plugins/omkafka
 endif
 
 if ENABLE_IMKAFKA
 SUBDIRS += plugins/imkafka
+endif
+
+if ENABLE_OMAZUREEVENTHUBS
+SUBDIRS += plugins/omazureeventhubs
+endif
+
+if ENABLE_IMDTLS
+SUBDIRS += plugins/imdtls
+endif
+
+if ENABLE_OMDTLS
+SUBDIRS += plugins/omdtls
 endif
 
 if ENABLE_OMPROG
@@ -268,6 +292,10 @@ endif
 
 if ENABLE_MMPSTRUCDATA
 SUBDIRS += plugins/mmpstrucdata
+endif
+
+if ENABLE_MMAITAG
+SUBDIRS += plugins/mmaitag
 endif
 
 if ENABLE_MMRFC5424ADDHMAC
@@ -348,10 +376,10 @@ DISTCHECK_CONFIGURE_FLAGS=
 # in a make distcheck is so that we detect code that accidently was not updated
 # when some global update happened.
 DISTCHECK_CONFIGURE_FLAGS+= \
-	--with-systemdsystemunitdir=$$dc_install_base/$(systemdsystemunitdir) \
 	--enable-silent-rules \
 	--enable-rsyslogd \
 	--enable-omstdout \
+	--enable-omsendertrack \
 	--enable-imdiag \
 	--enable-testbench \
 	--enable-valgrind
@@ -526,6 +554,18 @@ DISTCHECK_CONFIGURE_FLAGS+= --enable-omkafka
 endif
 if ENABLE_KAFKA_TESTS
 DISTCHECK_CONFIGURE_FLAGS+= --enable-kafka-tests
+endif
+
+if ENABLE_OMAZUREEVENTHUBS
+DISTCHECK_CONFIGURE_FLAGS+= --enable-omazureeventhubs
+endif
+
+if ENABLE_IMDTLS
+DISTCHECK_CONFIGURE_FLAGS+= --enable-imdtls
+endif
+
+if ENABLE_OMDTLS
+DISTCHECK_CONFIGURE_FLAGS+= --enable-omdtls
 endif
 
 if ENABLE_IMJOURNAL

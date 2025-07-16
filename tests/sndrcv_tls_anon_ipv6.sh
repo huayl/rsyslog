@@ -19,7 +19,7 @@ global(
 	defaultNetstreamDriverKeyFile="'$srcdir'/testsuites/x.509/client-key.pem"
 	defaultNetstreamDriver="gtls"
 	debug.whitelist="on"
-	debug.files=["nsd_ossl.c", "tcpsrv.c", "nsdsel_ossl.c", "nsdpoll_ptcp.c", "dnscache.c"]
+	debug.files=["net_ossl.c", "nsd_ossl.c", "tcpsrv.c", "nsdsel_ossl.c", "nsdpoll_ptcp.c", "dnscache.c"]
 )
 
 module(load="../plugins/imtcp/.libs/imtcp" maxSessions="1100"
@@ -54,7 +54,7 @@ startup 2
 
 # now inject the messages into instance 2. It will connect to instance 1,
 # and that instance will record the data.
-injectmsg
+injectmsg2
 
 # shut down sender when everything is sent, receiver continues to run concurrently
 shutdown_when_empty 2

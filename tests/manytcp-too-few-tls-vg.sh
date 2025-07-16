@@ -14,12 +14,12 @@ global(
 	defaultNetstreamDriverKeyFile="'$srcdir'/testsuites/x.509/client-key.pem"
 	defaultNetstreamDriver="gtls"
 	debug.whitelist="on"
-	debug.files=["nsd_ossl.c", "tcpsrv.c", "nsdsel_ossl.c", "nsdpoll_ptcp.c", "dnscache.c"]
+	debug.files=["net_ossl.c", "nsd_ossl.c", "tcpsrv.c", "nsdsel_ossl.c", "nsdpoll_ptcp.c", "dnscache.c"]
 )
 
 module(load="../plugins/imtcp/.libs/imtcp" maxSessions="1100"
        streamDriver.mode="1" streamDriver.authMode="anon")
-input(type="imtcp" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
+input(type="imtcp" socketBacklog="1000" port="0" listenPortFileName="'$RSYSLOG_DYNNAME'.tcpflood_port")
 
 $template outfmt,"%msg:F,58:2%\n"
 template(name="dynfile" type="string" string=`echo $RSYSLOG_OUT_LOG`) # trick to use relative path names!

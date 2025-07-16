@@ -26,10 +26,15 @@ name: check kafka distcheck
 
 on:
   pull_request:
+    paths-ignore:
+      - 'ChangeLog'
+      - '**/*.md'
+      - '**/*.txt'
+      - 'doc/**'
 
 jobs:
   check_run:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
     timeout-minutes: 50
 
     steps:

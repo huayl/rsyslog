@@ -1,4 +1,3 @@
-#!/bin/bash
 # 
 # this shell script provides commands to the common diag system. It enables
 # test scripts to wait for certain conditions and initiate certain actions.
@@ -68,6 +67,7 @@ export TB_ERR_TIMEOUT=101
 export ZOOPIDFILE="$(pwd)/zookeeper.pid"
 
 #valgrind="valgrind --malloc-fill=ff --free-fill=fe --log-fd=1"
+#valgrind="valgrind --tool=callgrind" # for kcachegrind profiling
 
 # **** use the line below for very hard to find leaks! *****
 #valgrind="valgrind --leak-check=full --show-leak-kinds=all --malloc-fill=ff --free-fill=fe --log-fd=1"
@@ -127,6 +127,21 @@ skip_platform() {
 		exit 77
 	fi
 
+}
+
+# function to skip a test if TSAN is enabled
+# This is necessary as TSAN does not properly handle thread creation
+# after fork() - which happens regularly in rsyslog if backgrounding
+# is activated.
+# $1 is the reason why TSAN is not supported
+# note: we depend on CFLAGS to properly reflect build options (what
+#       usually is the case when the testbench is run)
+skip_TSAN() {
+	echo skip:_TSAN, CFLAGS $CFLAGS
+	if [[ "$CFLAGS" == *"sanitize=thread"* ]]; then
+		printf 'test incompatible with TSAN because of %s\n' "$1"
+		exit 77
+	fi
 }
 
 
@@ -216,7 +231,8 @@ generate_conf() {
 	echo 'module(load="../plugins/imdiag/.libs/imdiag")
 global(inputs.timeout.shutdown="'$RSTB_GLOBAL_INPUT_SHUTDOWN_TIMEOUT'"
        default.action.queue.timeoutshutdown="'$RSTB_ACTION_DEFAULT_Q_TO_SHUTDOWN'"
-       default.action.queue.timeoutEnqueue="'$RSTB_ACTION_DEFAULT_Q_TO_ENQUEUE'")
+       default.action.queue.timeoutEnqueue="'$RSTB_ACTION_DEFAULT_Q_TO_ENQUEUE'"
+       debug.abortOnProgramError="on")
 # use legacy-style for the following settings so that we can override if needed
 $MainmsgQueueTimeoutEnqueue 20000
 $MainmsgQueueTimeoutShutdown '$RSTB_GLOBAL_QUEUE_SHUTDOWN_TIMEOUT'
@@ -302,7 +318,7 @@ wait_startup_pid() {
 		if [ $(date +%s) -gt $(( TB_STARTTEST + TB_TEST_MAX_RUNTIME )) ]; then
 		   printf '%s ABORT! Timeout waiting on startup (pid file %s)\n' "$(tb_timestamp)" "$1"
 		   ls -l "$1"
-		   ps -fp $(cat "$1")
+		   ps -fp $($SUDO cat "$1")
 		   error_exit 1
 		fi
 	done
@@ -485,7 +501,7 @@ wait_startup() {
 	echo "$(tb_timestamp) rsyslogd$1 startup msg seen, pid " $(cat $RSYSLOG_PIDBASE$1.pid)
 	wait_file_exists $RSYSLOG_DYNNAME.imdiag$1.port
 	eval export IMDIAG_PORT$1=$(cat $RSYSLOG_DYNNAME.imdiag$1.port)
-	eval PORT=$IMDIAG_PORT$1
+	eval PORT='$IMDIAG_PORT'$1
 	echo "imdiag$1 port: $PORT"
 	if [ "$PORT" == "" ]; then
 		echo "TESTBENCH ERROR: imdiag port not found!"
@@ -586,13 +602,32 @@ assign_file_content() {
 	printf 'exported: %s=%s\n' $1 "$content"
 }
 
+# start a minitcpsrvr with the regular parameters
+# $1 is the output file name
+# $2 is the instance name (1, 2)
+start_minitcpsrvr() {
+	instance=${2:-1}
+	./minitcpsrv -t127.0.0.1 -p 0 -P "$RSYSLOG_DYNNAME.minitcpsrvr_port$instance" -f "$1" $MINITCPSRV_EXTRA_OPTS &
+	BGPROCESS=$!
+	wait_file_exists "$RSYSLOG_DYNNAME.minitcpsrvr_port$instance"
+	if [ "$instance" == "1" ]; then
+		export MINITCPSRVR_PORT1="$(cat $RSYSLOG_DYNNAME.minitcpsrvr_port$instance)"
+	else
+		export MINITCPSRVR_PORT2="$(cat $RSYSLOG_DYNNAME.minitcpsrvr_port$instance)"
+	fi
+	echo "### background minitcpsrv process id is $BGPROCESS port $(cat $RSYSLOG_DYNNAME.minitcpsrvr_port$instance) ###"
+}
+
 # same as startup_vg, BUT we do NOT wait on the startup message!
 startup_vg_waitpid_only() {
 	startup_common "$1" "$2"
 	if [ "$RS_TESTBENCH_LEAK_CHECK" == "" ]; then
 		RS_TESTBENCH_LEAK_CHECK=full
 	fi
-	LD_PRELOAD=$RSYSLOG_PRELOAD valgrind $RS_TEST_VALGRIND_EXTRA_OPTS $RS_TESTBENCH_VALGRIND_EXTRA_OPTS --suppressions=$srcdir/known_issues.supp ${EXTRA_VALGRIND_SUPPRESSIONS:-} --gen-suppressions=all --log-fd=1 --error-exitcode=10 --malloc-fill=ff --free-fill=fe --leak-check=$RS_TESTBENCH_LEAK_CHECK ../tools/rsyslogd -C -n -i$RSYSLOG_PIDBASE$2.pid -M../runtime/.libs:../.libs -f$CONF_FILE &
+	# add --keep-debuginfo=yes for hard to find cases; this cannot be used generally,
+	# because it is only supported by newer versions of valgrind (else CI will fail
+	# on older platforms).
+	LD_PRELOAD=$RSYSLOG_PRELOAD valgrind $RS_TEST_VALGRIND_EXTRA_OPTS $RS_TESTBENCH_VALGRIND_EXTRA_OPTS --suppressions=$srcdir/known_issues.supp ${EXTRA_VALGRIND_SUPPRESSIONS:-} --gen-suppressions=all --log-fd=1 --error-exitcode=10 --malloc-fill=ff --free-fill=fe --leak-check=$RS_TESTBENCH_LEAK_CHECK ../tools/rsyslogd -C -n -i$RSYSLOG_PIDBASE$instance.pid -M../runtime/.libs:../.libs -f$CONF_FILE &
 	wait_rsyslog_startup_pid $1
 }
 
@@ -600,7 +635,7 @@ startup_vg_waitpid_only() {
 # returns only after successful startup, $2 is the instance (blank or 2!)
 startup_vg() {
 		startup_vg_waitpid_only $1 $2
-		wait_startup $2
+		wait_startup $instance
 		reassign_ports
 }
 
@@ -645,8 +680,8 @@ injectmsg() {
 # inject messages in INSTANCE 2 via our inject interface (imdiag)
 injectmsg2() {
 	msgs=${2:-$NUMMESSAGES}
-	echo injecting $2 messages into instance 2
-	echo injectmsg "$1:-0" "$msgs" $3 $4 | $TESTTOOL_DIR/diagtalker -p$IMDIAG_PORT2 || error_exit  $?
+	echo injecting $msgs messages into instance 2
+	echo injectmsg "${1:-0}" "$msgs" $3 $4 | $TESTTOOL_DIR/diagtalker -p$IMDIAG_PORT2 || error_exit  $?
 	# TODO: some return state checking? (does it really make sense here?)
 }
 
@@ -694,17 +729,29 @@ content_check() {
 	else
 		grep_opt=-F
 	fi
+	if [ "$1" == "--output-results" ]; then
+		output_results="yes"
+		shift
+	else
+		output_results="no"
+	fi
 	file=${2:-$RSYSLOG_OUT_LOG}
 	if ! grep -q  $grep_opt -- "$1" < "${file}"; then
 	    if [ "$check_only" == "yes" ]; then
 		printf 'content_check did not yet succeed\n'
-	    return 1
+		return 1
 	    fi
 	    printf '\n============================================================\n'
 	    printf 'FILE "%s" content:\n' "$file"
 	    cat -n ${file}
 	    printf 'FAIL: content_check failed to find "%s"\n' "$1"
 	    error_exit 1
+	else
+	    if [ "$output_results" == "yes" ]; then
+		# Output GREP results
+		echo "SUCCESS: content_check found results for '$1'\n"
+		grep "$1" "${file}"
+	    fi
 	fi
 	if [ "$check_only" == "yes" ]; then
 	    return 0
@@ -752,7 +799,7 @@ content_check_with_count() {
 			count=$(grep -c -F -- "$1" <${RSYSLOG_OUT_LOG})
 		fi
 		if [ ${count:=0} -eq $2 ]; then
-			echo content_check_with_count SUCCESS, \"$1\" occured $2 times
+			echo content_check_with_count SUCCESS, \"$1\" occurred $2 times
 			break
 		else
 			if [ "$timecounter" == "$timeoutend" ]; then
@@ -877,6 +924,39 @@ check_journal_testmsg_received() {
 	fi;
 }
 
+# checks that among the open files found in /proc/<PID>/fd/*
+# there is or is not, depending on the calling mode,
+# a link with the specified suffix in the target name
+check_fd_for_pid() {
+  local pid="$1" mode="$2" suffix="$3" target seen
+  seen="false"
+  for fd in $(echo /proc/$pid/fd/*); do
+    target="$(readlink -m "$fd")"
+    if [[ "$target" != *$RSYSLOG_DYNNAME* ]]; then
+      continue
+    fi
+    if ((i % 10 == 0)); then
+      echo "INFO: check target='$target'"
+    fi
+    if [[ "$target" == *$suffix ]]; then
+      seen="true"
+      if [[ "$mode" == "exists" ]]; then
+        echo "PASS: check fd for pid=$pid mode='$mode' suffix='$suffix'"
+        return 0
+      fi
+    fi
+  done
+  if [[ "$seen" == "false" ]] && [[ "$mode" == "absent" ]]; then
+    echo "PASS: check fd for pid=$pid mode='$mode' suffix='$suffix'"
+    return 0
+  fi
+  echo "FAIL: check fd for pid=$pid mode='$mode' suffix='$suffix'"
+  if [[ "$mode" != "ignore" ]]; then
+    return 1
+  fi
+  return 0
+}
+
 # wait for main message queue to be empty. $1 is the instance.
 # we run in a loop to ensure rsyslog is *really* finished when a
 # function for the "finished predicate" is defined. This is done
@@ -903,7 +983,7 @@ wait_queueempty() {
 
 # shut rsyslogd down when main queue is empty. $1 is the instance.
 shutdown_when_empty() {
-	echo Shutting down instance ${1:-1}
+	printf '%s Shutting down instance %s\n' "$(date +%H:%M:%S)" ${1:-1}
 	wait_queueempty $1
 	if [ "$RSYSLOG_PIDBASE" == "" ]; then
 		echo "RSYSLOG_PIDBASE is EMPTY! - bug in test? (instance $1)"
@@ -970,6 +1050,19 @@ quit"
 }
 
 
+# wait for HUP to complete. $1 is the instance
+# note: there is a slight chance HUP was not completed. This can happen if it takes
+# the system very long (> 500ms) to receive the HUP and set the internal flag
+# variable. aka "very very low probability".
+await_HUP_processed() {
+	if [ "$1" == "2" ]; then
+		echo AwaitHUPComplete | $TESTTOOL_DIR/diagtalker -pIMDIAG_PORT2 || error_exit  $?
+	else
+		echo AwaitHUPComplete | $TESTTOOL_DIR/diagtalker -p$IMDIAG_PORT || error_exit  $?
+	fi
+}
+
+
 # wait for all pending lookup table reloads to complete $1 is the instance.
 await_lookup_table_reload() {
 	if [ "$1" == "2" ]; then
@@ -1004,6 +1097,16 @@ wait_file_lines() {
 		count_function="$2"
 		shift 2
 	fi
+	interrupt_connection=NO
+	if [ "$1" == "--interrupt-connection" ]; then
+		interrupt_connection="YES"
+		interrupt_host="$2"
+		interrupt_port="$3"
+		interrupt_tick="$4"
+		shift 4
+		lastcurrent_time=0
+	fi
+
 	timeout=${3:-$TB_TEST_TIMEOUT}
 	timeoutbegin=$(date +%s)
 	timeoutend=$(( timeoutbegin + timeout ))
@@ -1045,6 +1148,15 @@ wait_file_lines() {
 				error_exit 1
 			else
 				echo $(date +%H:%M:%S) wait_file_lines waiting, expected $waitlines, current $count lines
+
+				current_time=$(date +%s)
+				if [ $interrupt_connection == "YES" ] && [ $current_time -gt $lastcurrent_time ] && [ $((current_time % $interrupt_tick)) -eq 0 ] && [ ${count} -gt 1 ]; then
+					# Interrupt Connection - requires root and linux kernel >= 4.9 in order to work!
+					echo wait_file_lines Interrupt Connection on ${interrupt_host}:${interrupt_port}
+					sudo ss -K dst ${interrupt_host} dport = ${interrupt_port}
+				fi
+				lastcurrent_time=$current_time
+
 				$TESTTOOL_DIR/msleep $delay
 			fi
 		fi
@@ -1154,8 +1266,10 @@ issue_HUP() {
 		sleeptime=1000
 	fi
 	kill -HUP $(cat $RSYSLOG_PIDBASE$1.pid)
-	printf 'HUP issued to pid %d\n' $(cat $RSYSLOG_PIDBASE$1.pid)
-	$TESTTOOL_DIR/msleep $sleeptime
+	printf 'HUP issued to pid %d - waiting for it to become processed\n' \
+		$(cat $RSYSLOG_PIDBASE$1.pid)
+	await_HUP_processed
+	#$TESTTOOL_DIR/msleep $sleeptime
 }
 
 
@@ -1300,6 +1414,11 @@ error_exit() {
 	# Extended Exit handling for kafka / zookeeper instances 
 	kafka_exit_handling "false"
 
+	# Ensure redis instance is stopped
+	if [ -n "$REDIS_DYN_DIR" ]; then
+		stop_redis
+	fi
+
 	error_stats $1 # Report error to rsyslog testbench stats
 	do_cleanup
 
@@ -1381,6 +1500,9 @@ seq_check() {
 	fi
 	if [ "${SEQ_CHECK_FILE##*.}" == "gz" ]; then
 		gunzip -c "${SEQ_CHECK_FILE}" | $RS_SORTCMD $RS_SORT_NUMERIC_OPT | ./chkseq -s$startnum -e$endnum $3 $4 $5 $6 $7 $SEQ_CHECK_OPTIONS
+	elif [ "${SEQ_CHECK_FILE##*.}" == "zst" ]; then
+		ls -l "${SEQ_CHECK_FILE}"
+		unzstd < "${SEQ_CHECK_FILE}" | $RS_SORTCMD $RS_SORT_NUMERIC_OPT | ./chkseq -s$startnum -e$endnum $3 $4 $5 $6 $7 $SEQ_CHECK_OPTIONS
 	else
 		$RS_SORTCMD $RS_SORT_NUMERIC_OPT < "${SEQ_CHECK_FILE}" | ./chkseq -s$startnum -e$endnum $3 $4 $5 $6 $7 $SEQ_CHECK_OPTIONS
 	fi
@@ -1391,6 +1513,10 @@ seq_check() {
 	if [ $ret -ne 0 ]; then
 		if [ "${SEQ_CHECK_FILE##*.}" == "gz" ]; then
 			gunzip -c "${SEQ_CHECK_FILE}" | $RS_SORTCMD $RS_SORT_NUMERIC_OPT \
+				| ./chkseq -s$startnum -e$endnum $3 $4 $5 $6 $7 $SEQ_CHECK_OPTIONS \
+				> $RSYSLOG_DYNNAME.error.log
+		elif [ "${SEQ_CHECK_FILE##*.}" == "zst" ]; then
+			unzstd < "${SEQ_CHECK_FILE}" | $RS_SORTCMD $RS_SORT_NUMERIC_OPT \
 				| ./chkseq -s$startnum -e$endnum $3 $4 $5 $6 $7 $SEQ_CHECK_OPTIONS \
 				> $RSYSLOG_DYNNAME.error.log
 		else
@@ -1512,6 +1638,9 @@ exit_test() {
 	# Extended Exit handling for kafka / zookeeper instances 
 	kafka_exit_handling "true"
 
+	# Ensure redis is stopped
+	stop_redis
+
 	printf '%s Test %s SUCCESSFUL (took %s seconds)\n' "$(tb_timestamp)" "$0" "$(( $(date +%s) - TB_STARTTEST ))"
 	echo  -------------------------------------------------------------------------------
 	exit 0
@@ -1606,17 +1735,17 @@ presort() {
 
 #START: ext kafka config
 #dep_cache_dir=$(readlink -f .dep_cache)
-export RS_ZK_DOWNLOAD=apache-zookeeper-3.6.2-bin.tar.gz
+export RS_ZK_DOWNLOAD=apache-zookeeper-3.9.3-bin.tar.gz
 dep_cache_dir=$(pwd)/.dep_cache
-dep_zk_url=https://downloads.apache.org/zookeeper/zookeeper-3.6.2/$RS_ZK_DOWNLOAD
+dep_zk_url=https://downloads.apache.org/zookeeper/zookeeper-3.9.3/$RS_ZK_DOWNLOAD
 dep_zk_cached_file=$dep_cache_dir/$RS_ZK_DOWNLOAD
 
-export RS_KAFKA_DOWNLOAD=kafka_2.12-2.7.0.tgz
-dep_kafka_url=http://www-us.apache.org/dist/kafka/2.7.0/kafka_2.12-2.7.0.tgz
+export RS_KAFKA_DOWNLOAD=kafka_2.13-2.8.0.tgz
+dep_kafka_url="https://www.rsyslog.com/files/download/rsyslog/$RS_KAFKA_DOWNLOAD"
 dep_kafka_cached_file=$dep_cache_dir/$RS_KAFKA_DOWNLOAD
 
 if [ -z "$ES_DOWNLOAD" ]; then
-	export ES_DOWNLOAD=elasticsearch-5.6.9.tar.gz
+	export ES_DOWNLOAD=elasticsearch-7.14.1-linux-x86_64.tar.gz
 fi
 if [ -z "$ES_PORT" ]; then
 	export ES_PORT=19200
@@ -1678,15 +1807,16 @@ download_kafka() {
 			wget -q $dep_zk_url -O $dep_zk_cached_file
 			if [ $? -ne 0 ]
 			then
-				echo error during wget, retry:
-				wget $dep_zk_url -O $dep_zk_cached_file
-				if [ $? -ne 0 ]
-				then
-					error_exit 1
-				fi
-			fi
-		fi
-	fi
+                                echo error during wget, retry:
+                                wget $dep_zk_url -O $dep_zk_cached_file
+                                if [ $? -ne 0 ]
+                                then
+                                        echo "Skipping test - unable to download zookeeper"
+                                        error_exit 77
+                                fi
+                        fi
+                fi
+        fi
 	if [ ! -f $dep_kafka_cached_file ]; then
 		if [ -f /local_dep_cache/$RS_KAFKA_DOWNLOAD ]; then
 			printf 'Kafka: satisfying dependency %s from system cache.\n' "$RS_KAFKA_DOWNLOAD"
@@ -1697,15 +1827,16 @@ download_kafka() {
 			if [ $? -ne 0 ]
 			then
 				echo error during wget, retry:
-				wget $dep_kafka_url -O $dep_kafka_cached_file
-				if [ $? -ne 0 ]
-				then
-					rm $dep_kafka_cached_file # a 0-size file may be left over
-					error_exit 1
-				fi
-			fi
-		fi
-	fi
+                                wget $dep_kafka_url -O $dep_kafka_cached_file
+                                if [ $? -ne 0 ]
+                                then
+                                        rm $dep_kafka_cached_file # a 0-size file may be left over
+                                        echo "Skipping test - unable to download kafka"
+                                        error_exit 77
+                                fi
+                        fi
+                fi
+        fi
 }
 
 stop_kafka() {
@@ -2122,9 +2253,16 @@ prepare_elasticsearch() {
 	if [ -n "${ES_PORT:-}" ] ; then
 		rm -f $dep_work_dir/es/config/elasticsearch.yml
 		sed "s/^http.port:.*\$/http.port: ${ES_PORT}/" $srcdir/testsuites/$dep_work_es_config > $dep_work_dir/es/config/elasticsearch.yml
+		if [ "$ES_DOWNLOAD" != "elasticsearch-6.0.0.tar.gz" ]; then
+			printf 'xpack.security.enabled: false\n' >> $dep_work_dir/es/config/elasticsearch.yml
+		fi
 	else
 		cp -f $srcdir/testsuites/$dep_work_es_config $dep_work_dir/es/config/elasticsearch.yml
 	fi
+
+	# Avoid deprecated parameter, new option introduced with 6.7
+	echo "Setting transport tcp option to ${ES_PORT_OPTION:-transport.tcp.port}"
+	sed -i "s/transport.tcp.port/${ES_PORT_OPTION:-transport.tcp.port}/g" "$dep_work_dir/es/config/elasticsearch.yml"
 
 	if [ ! -d $dep_work_dir/es/data ]; then
 			echo "Creating elastic search directories"
@@ -2144,23 +2282,29 @@ ensure_elasticsearch_ready() {
 	then
 		printf 'Elasticsearch already running, NOT restarting it\n'
 	else
+		printf '%s Elasticsearch not yet running, starting it\n' "$(date +%H:%M:%S)"
 		cat elasticsearch.running
 		cleanup_elasticsearch
 		dep_es_cached_file="$dep_cache_dir/$ES_DOWNLOAD"
 		download_elasticsearch
 		prepare_elasticsearch
-		start_elasticsearch
-		printf '%s:%s:%s\n' "$ES_DOWNLOAD" "$ES_PORT" "$(cat es.pid)" > elasticsearch.running
+		if [ "$1" != "--no-start" ]; then
+			start_elasticsearch
+			printf '%s:%s:%s\n' "$ES_DOWNLOAD" "$ES_PORT" "$(cat es.pid)" > elasticsearch.running
+		fi
 	fi
-	printf 'running elasticsearch instance: %s\n' "$(cat elasticsearch.running)"
-	init_elasticsearch
+	if [ "$1" != "--no-start" ]; then
+		printf 'running elasticsearch instance: %s\n' "$(cat elasticsearch.running)"
+		init_elasticsearch
+	fi
+	printf '\n%s Elasticsearch readied for use as requested\n' "$(date +%H:%M:%S)"
 }
 
 
 # $2, if set, is the number of additional ES instances
 start_elasticsearch() {
-	# Heap Size (limit to 128MB for testbench! defaults is way to HIGH)
-	export ES_JAVA_OPTS="-Xms128m -Xmx128m"
+	# Heap Size (limit to 256MB for testbench! defaults is way to HIGH)
+	export ES_JAVA_OPTS="-Xms256m -Xmx256m"
 
 	dep_work_dir=$(readlink -f .dep_wrk)
 	dep_work_es_config="es.yml"
@@ -2170,14 +2314,15 @@ start_elasticsearch() {
 	# THIS IS THE ACTUAL START of ES
 	$dep_work_dir/es/bin/elasticsearch -p $dep_work_es_pidfile -d
 	$TESTTOOL_DIR/msleep 2000
-	# TODO: wait pidfile!
+	wait_startup_pid $dep_work_es_pidfile
 	printf 'elasticsearch pid is %s\n' "$(cat $dep_work_es_pidfile)"
 
 	# Wait for startup with hardcoded timeout
-	timeoutend=60
+	timeoutend=120
 	timeseconds=0
 	# Loop until elasticsearch port is reachable or until
 	# timeout is reached!
+	curl --silent --show-error --connect-timeout 1 http://localhost:${ES_PORT:-19200}
 	until [ "$(curl --silent --show-error --connect-timeout 1 http://localhost:${ES_PORT:-19200} | grep 'rsyslog-testbench')" != "" ]; do
 		echo "--- waiting for ES startup: $timeseconds seconds"
 		$TESTTOOL_DIR/msleep 1000
@@ -2185,6 +2330,16 @@ start_elasticsearch() {
 
 		if [ "$timeseconds" -gt "$timeoutend" ]; then 
 			echo "--- TIMEOUT ( $timeseconds ) reached!!!"
+			if [ ! -d $dep_work_dir/es ]; then
+				echo "ElasticSearch $dep_work_dir/es does not exist, no ElasticSearch debuglog"
+			else
+				echo "Dumping rsyslog-testbench.log from ElasticSearch instance $1"
+				echo "========================================="
+				cat $dep_work_dir/es/logs/rsyslog-testbench.log
+				echo "========================================="
+#				printf 'non-info is:\n'
+#				grep --invert-match '^\[.* INFO ' $dep_work_dir/kafka/logs/server.log | grep '^\['
+			fi
 			error_exit 1
 		fi
 	done
@@ -2196,8 +2351,12 @@ start_elasticsearch() {
 # $1 - number of records (ES does not return all records unless you tell it explicitly).
 # $2 - ES port
 es_getdata() {
+	printf '%s getting data from ElasticSearch\n' "$(date +%H:%M:%S)"
 	curl --silent -XPUT --show-error -H 'Content-Type: application/json' "http://localhost:${2:-$ES_PORT}/rsyslog_testbench/_settings" -d '{ "index" : { "max_result_window" : '${1:-$NUMMESSAGES}' } }'
+	# refresh to ensure we get the latest data
+	curl --silent localhost:${2:-$ES_PORT}/rsyslog_testbench/_refresh
 	curl --silent localhost:${2:-$ES_PORT}/rsyslog_testbench/_search?size=${1:-$NUMMESSAGES} > $RSYSLOG_DYNNAME.work
+	printf '\n'
 	$PYTHON $srcdir/es_response_get_msgnum.py > ${RSYSLOG_OUT_LOG}
 }
 
@@ -2219,7 +2378,7 @@ es_shutdown_empty_check() {
 stop_elasticsearch() {
 	dep_work_dir=$(readlink -f $srcdir)
 	dep_work_es_pidfile="es.pid"
-	rm elasticsearch.running
+	rm -f elasticsearch.running
 	if [ -e $dep_work_es_pidfile ]; then
 		es_pid=$(cat $dep_work_es_pidfile)
 		printf 'stopping ES with pid %d\n' $es_pid
@@ -2265,7 +2424,7 @@ omhttp_start_server() {
     omhttp_server_logfile="${omhttp_work_dir}/omhttp_server.log"
     mkdir -p ${omhttp_work_dir}
 
-    server_args="-p $omhttp_server_port ${*:2}"
+    server_args="-p $omhttp_server_port ${*:2} --port-file $RSYSLOG_DYNNAME.omhttp_server_lstnport.file"
 
     timeout 30m $PYTHON ${omhttp_server_py} ${server_args} >> ${omhttp_server_logfile} 2>&1 &
     if [ ! $? -eq 0 ]; then
@@ -2273,10 +2432,12 @@ omhttp_start_server() {
         rm -rf $omhttp_work_dir
         error_exit 1
     fi
-
     omhttp_server_pid=$!
+
+    wait_file_exists "$RSYSLOG_DYNNAME.omhttp_server_lstnport.file"
+    omhttp_server_lstnport="$(cat $RSYSLOG_DYNNAME.omhttp_server_lstnport.file)"
     echo ${omhttp_server_pid} > ${omhttp_server_pidfile}
-    echo "Started omhttp test server with args ${server_args} with pid ${omhttp_server_pid}"
+    echo "Started omhttp test server with args ${server_args} with pid ${omhttp_server_pid}, port {$omhttp_server_lstnport}"
 }
 
 omhttp_stop_server() {
@@ -2339,6 +2500,20 @@ omhttp_get_data() {
         > ${RSYSLOG_OUT_LOG}
 }
 
+omhttp_validate_metadata_response() {
+	echo "starting to validate omhttp response metadata."
+    omhttp_response_validate_py=$srcdir/omhttp-validate-response.py
+    if [ ! -f $omhttp_response_validate_py ]; then
+        echo "Cannot find ${omhttp_response_validate_py} for omhttp test"
+        error_exit 1
+    fi
+
+	$PYTHON ${omhttp_response_validate_py} --error ${RSYSLOG_DYNNAME}/omhttp.error.log --response ${RSYSLOG_DYNNAME}/omhttp.response.log 2>&1
+	if [ $? -ne 0 ] ; then
+		printf 'omhttp_validate_metadata_response failed \n'
+		error_exit 1 
+	fi
+}
 
 # prepare MySQL for next test
 # each test receives its own database so that we also can run in parallel
@@ -2373,6 +2548,97 @@ mysql_cleanup_test() {
 }
 
 
+start_redis() {
+	check_command_available redis-server
+
+	export REDIS_DYN_CONF="${RSYSLOG_DYNNAME}.redis.conf"
+	export REDIS_DYN_DIR="$(pwd)/${RSYSLOG_DYNNAME}-redis"
+
+	# Only set a random port if not set (useful when Redis must be restarted during a test)
+	if [ -z "$REDIS_RANDOM_PORT" ]; then
+		export REDIS_RANDOM_PORT="$(get_free_port)"
+	fi
+
+	cp $srcdir/testsuites/redis.conf $REDIS_DYN_CONF
+	mkdir -p $REDIS_DYN_DIR
+
+	sed -itemp "s+<tmpdir>+${REDIS_DYN_DIR}+g" $REDIS_DYN_CONF
+	sed -itemp "s+<rndport>+${REDIS_RANDOM_PORT}+g" $REDIS_DYN_CONF
+
+	# Start the server
+	echo "Starting redis with conf file $REDIS_DYN_CONF"
+	redis-server $REDIS_DYN_CONF &
+	$TESTTOOL_DIR/msleep 2000
+
+	# Wait for Redis to be fully up
+	timeoutend=10
+	until nc -w1 -z 127.0.0.1 $REDIS_RANDOM_PORT; do
+		echo "Waiting for Redis to start..."
+		$TESTTOOL_DIR/msleep 1000
+		(( timeseconds=timeseconds + 2 ))
+
+		if [ "$timeseconds" -gt "$timeoutend" ]; then
+			echo "--- TIMEOUT ( $timeseconds ) reached!!!"
+			if [ ! -d ${REDIS_DYN_DIR}/redis.log ]; then
+				echo "no Redis logs"
+			else
+				echo "Dumping ${REDIS_DYN_DIR}/redis.log"
+				echo "========================================="
+				cat ${REDIS_DYN_DIR}/redis.log
+				echo "========================================="
+			fi
+			error_exit 1
+		fi
+	done
+}
+
+cleanup_redis() {
+	if [ -d ${REDIS_DYN_DIR} ]; then
+		rm -rf ${REDIS_DYN_DIR}
+	fi
+	if [ -f ${REDIS_DYN_CONF} ]; then
+		rm -f ${REDIS_DYN_CONF}
+	fi
+}
+
+stop_redis() {
+	if [ -f "$REDIS_DYN_DIR/redis.pid" ]; then
+		redispid=$(cat $REDIS_DYN_DIR/redis.pid)
+		echo "Stopping Redis instance"
+		kill $redispid
+
+		i=0
+
+		# Check if redis instance went down!
+		while [ -f $REDIS_DYN_DIR/redis.pid ]; do
+			redispid=$(cat $REDIS_DYN_DIR/redis.pid)
+			if [[ "" !=  "$redispid" ]]; then
+				$TESTTOOL_DIR/msleep 100 # wait 100 milliseconds
+				if test $i -gt $TB_TIMEOUT_STARTSTOP; then
+					echo "redis server (PID $redispid) still running - Performing hard shutdown (-9)"
+					kill -9 $redispid
+					break
+				fi
+				(( i++ ))
+			else
+				# Break the loop
+				break
+			fi
+		done
+	fi
+}
+
+redis_command() {
+	check_command_available redis-cli
+
+	if [ -z "$1" ]; then
+		echo "redis_command: no command provided!"
+		error_exit 1
+	fi
+
+	printf "$1\n" | redis-cli -p "$REDIS_RANDOM_PORT"
+}
+
 # $1 - replacement string
 # $2 - start search string
 # $3 - file name
@@ -2392,9 +2658,17 @@ first_column_sum_check() {
 # Helper functions to start/stop python snmp trap receiver
 #
 snmp_start_trapreceiver() {
+	SNMP_PYTHON=${SNMP_PYTHON:-$PYTHON}
     # Args: 1=port 2=outputfilename
     # Args 2 and up are passed along as is to snmptrapreceiver.py
-    snmptrapreceiver=$srcdir/snmptrapreceiver.py
+    echo "Checking Python version..."
+    if $SNMP_PYTHON -c 'import sys; print("Python version:", sys.version_info); exit(0 if sys.version_info >= (3,11) else 1)' 2>/dev/null; then
+        echo "Python version > 3.10, using snmptrapreceiverv2.py"
+        snmptrapreceiver=$srcdir/snmptrapreceiverv2.py
+    else
+        echo "Python version < 3.10, using snmptrapreceiver.py"
+        snmptrapreceiver=$srcdir/snmptrapreceiver.py
+    fi
     if [ ! -f ${snmptrapreceiver} ]; then
         echo "Cannot find ${snmptrapreceiver} for omsnmp test"
         error_exit 1
@@ -2420,31 +2694,45 @@ snmp_start_trapreceiver() {
     mkdir -p ${snmp_work_dir}
 
     server_args="${snmp_server_port} 127.0.0.1 ${output_file}"
-
-    $PYTHON ${snmptrapreceiver} ${server_args} ${snmp_server_logfile} >> ${snmp_server_logfile} 2>&1 &
-    if [ ! $? -eq 0 ]; then
-        echo "Failed to start snmptrapreceiver."
-        rm -rf ${snmp_work_dir}
-        error_exit 1
-    fi
-
+    echo "RUN SNMP SERVER WITH: $SNMP_PYTHON ${snmptrapreceiver} ${server_args} ${snmp_server_logfile} >> ${snmp_server_logfile} 2>&1"
+    $SNMP_PYTHON ${snmptrapreceiver} ${server_args} ${snmp_server_logfile} >> ${snmp_server_logfile} 2>&1 &
     snmp_server_pid=$!
+    if ! ps -p $snmp_server_pid > /dev/null 2>&1; then
+        echo "Failed to start snmptrapreceiver wiht $SNMP_PYTHON."
+        if [ "$SNMP_PYTHON" = "/usr/bin/python" ]; then
+            SNMP_PYTHON="/usr/bin/python3"
+			rm -rf ${snmp_work_dir}
+		    mkdir -p ${snmp_work_dir}
+            echo "Retrying with python3..."
+		    echo "RUN SNMP SERVER WITH: $SNMP_PYTHON ${snmptrapreceiver} ${server_args} ${snmp_server_logfile} >> ${snmp_server_logfile} 2>&1"
+            $SNMP_PYTHON ${snmptrapreceiver} ${server_args} ${snmp_server_logfile} >> ${snmp_server_logfile} 2>&1 &
+			snmp_server_pid=$!
+			if ! ps -p $snmp_server_pid > /dev/null 2>&1; then
+                echo "Failed to start snmptrapreceiver with $SNMP_PYTHON."
+				rm -rf ${snmp_work_dir}
+                error_exit 1
+            fi
+        fi
+    fi
     echo ${snmp_server_pid} > ${snmp_server_pidfile}
 
+	while test ! -f ${snmp_server_logfile}.started; do
+		$TESTTOOL_DIR/msleep 100 # wait 100 milliseconds
+		printf "."
+	done
+
     while test ! -s "${snmp_server_logfile}"; do
-	$TESTTOOL_DIR/msleep 100 # wait 100 milliseconds
-	if [ $(date +%s) -gt $(( TB_STARTTEST + TB_TEST_MAX_RUNTIME )) ]; then
-	   printf '%s ABORT! Timeout waiting on startup (pid file %s)\n' "$(tb_timestamp)" "$1"
-	   ls -l "$1"
-	   ps -fp $(cat "$1")
-	   snmp_stop_trapreceiver
-	   error_exit 1
-#	else 
-#	   echo "waiting...${snmp_server_logfile}..."
-	fi
+		$TESTTOOL_DIR/msleep 100 # wait 100 milliseconds
+		if [ $(date +%s) -gt $(( TB_STARTTEST + TB_TEST_MAX_RUNTIME )) ]; then
+		printf '%s ABORT! Timeout waiting on startup (pid file %s)\n' "$(tb_timestamp)" "$1"
+		ls -l "$1"
+		ps -fp $(cat "$1")
+		snmp_stop_trapreceiver
+		error_exit 1
+		fi
     done
 
-    echo "Started snmptrapreceiver with args ${server_args} with pid ${snmp_server_pid}"
+    echo "Started snmptrapreceiver with ${SNMP_PYTHON} args ${server_args} with pid ${snmp_server_pid}"
 }
 
 snmp_stop_trapreceiver() {
@@ -2456,6 +2744,8 @@ snmp_stop_trapreceiver() {
         echo "Stopping snmptrapreceiver server"
         kill -9 $(cat ${snmp_work_dir}/snmp_server.pid) > /dev/null 2>&1
         # Done at testexit already!: rm -rf ${snmp_work_dir}
+	echo "SNMP Trap Receiver log:"
+	cat ${snmp_work_dir}//snmp_server.log
     fi
 }
 
@@ -2491,6 +2781,17 @@ wait_for_stats_flush() {
 	echo "stats push registered"
 }
 
+# Check file exists and is of a particular size
+# $1 - file to check
+# $2 - size to check
+file_size_check() {
+    local size=$(ls -l $1 | awk {'print $5'})
+    if [ "${size}" != "${2}" ]; then
+	printf 'File:[%s] has unexpected size. Expected:[%d], Size:[%d]\n', $1 $2 $size
+        error_exit 1
+    fi
+    return 0
+}
 
 case $1 in
    'init')	$srcdir/killrsyslog.sh # kill rsyslogd if it runs for some reason
@@ -2531,9 +2832,16 @@ case $1 in
 		export RSYSLOG_OUT_LOG="${RSYSLOG_DYNNAME}.out.log"
 		export RSYSLOG2_OUT_LOG="${RSYSLOG_DYNNAME}_2.out.log"
 		export RSYSLOG_PIDBASE="${RSYSLOG_DYNNAME}:" # also used by instance 2!
-		#export IMDIAG_PORT=13500 DELETE ME
-		#export IMDIAG_PORT2=13501 DELETE ME
-		#export TCPFLOOD_PORT=13514 DELETE ME
+
+		# ensure test tools exist when running tests directly
+		if [ ! -x "${TESTTOOL_DIR}/tcpflood" ]; then
+			echo 'Building test tools...'
+			# build all test tools via "make check" - configure knows which tools
+			# to enable based on detected libraries, and TESTS="" ensures only
+			# compilation (no test execution). This is more robust than ad hoc
+			# builds because it honors configure-time feature detection.
+make -j$(getconf _NPROCESSORS_ONLN) check TESTS="" || error_exit 100
+		fi
 
 		# Extra Variables for Test statistic reporting
 		export RSYSLOG_TESTNAME=$(basename $0)

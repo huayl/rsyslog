@@ -17,7 +17,7 @@
 .\" along with this program; if not, write to the Free Software
 .\" Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111, USA.
 .\"
-.TH RSYSLOG.CONF 5 "22 October 2012" "Version 7.2.0" "Linux System Administration"
+.TH RSYSLOG.CONF 5 "18 February 2025" "Version 8.2502.0" "Linux System Administration"
 .SH NAME
 rsyslog.conf \- rsyslogd(8) configuration file
 .SH DESCRIPTION
@@ -207,6 +207,29 @@ all that priorities, either exact this one or this and any higher priority. If
 you use both extensions then the exclamation mark must occur before the equals
 sign, just use it intuitively.
 
+However, please note that there are some restrictions over the traditional
+BSD syslog behaviour. These restrictions stem back to sysklogd, exist
+probably since at least the 1990's and as such have always been in
+rsyslog.
+
+Namely, in BSD syslogd you can craft a selector like this:
+
+*.debug;local6.err
+
+The intent is to log all facilities at debug or higher, except for local6,
+which should only log at err or higher.
+
+Unfortunately, local6.err will permit error severity and higher, but will
+not exclude lower severity messages from facility local6.
+
+As an alternative, you can explicitly exclude all severities that you do
+not want to match. For the above case, this selector is equivalent to the
+BSD syslog selector:
+
+*.debug;local6.!=info;local6.!=notice;local6.!=warn
+
+An easier approach is probably to do if ... then based matching in script.
+
 .SH ACTIONS
 The action field of a rule describes what to do with the message. In general, message content 
 is written to a kind of "logfile". But also other actions might be done, like writing to a 
@@ -364,7 +387,7 @@ need to filter based on priority and facility, you should do this with selector 
 not second-class citizens in rsyslog and offer the best performance for this job.
 
 .SS Property-Based Filters
-Property-based filters are unique to rsyslogd. They allow to filter on any property, like HOSTNAME, 
+Property-based filters are unique to rsyslogd. They allow one to filter on any property, like HOSTNAME, 
 syslogtag and msg. 
 
 A property-based filter must start with a colon in column 0. This tells rsyslogd that it is the new 
